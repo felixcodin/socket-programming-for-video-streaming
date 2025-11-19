@@ -3,12 +3,14 @@ import sys, traceback, threading, socket
 
 from VideoStream import VideoStream
 from RtpPacket import RtpPacket
+from time import time
 
 class ServerWorker:
 	SETUP = 'SETUP'
 	PLAY = 'PLAY'
 	PAUSE = 'PAUSE'
 	TEARDOWN = 'TEARDOWN'
+	MAX_PAYLOAD_SIZE = 1400
 	
 	INIT = 0
 	READY = 1
@@ -85,6 +87,7 @@ class ServerWorker:
 				self.clientInfo['event'] = threading.Event()
 				self.clientInfo['worker']= threading.Thread(target=self.sendRtp) 
 				self.clientInfo['worker'].start()
+				self.clientInfo['rtpSeqNum'] = 0
 		
 		# Process PAUSE request
 		elif requestType == self.PAUSE:
@@ -106,50 +109,12 @@ class ServerWorker:
 			
 			# Close the RTP socket
 			self.clientInfo['rtpSocket'].close()
-			
-	def sendRtp(self):
-		"""Send RTP packets over UDP."""
-		while True:
-			self.clientInfo['event'].wait(0.05) 
-			
-			# Stop sending if request is PAUSE or TEARDOWN
-			if self.clientInfo['event'].isSet(): 
-				break 
-				
-			data = self.clientInfo['videoStream'].nextFrame()
-			if data: 
-				frameNumber = self.clientInfo['videoStream'].frameNbr()
-				try:
-					address = self.clientInfo['rtspSocket'][1][0]
-					port = int(self.clientInfo['rtpPort'])
-					self.clientInfo['rtpSocket'].sendto(self.makeRtp(data, frameNumber),(address,port))
-				except:
-					print("Connection Error")
-					#print('-'*60)
-					#traceback.print_exc(file=sys.stdout)
-					#print('-'*60)
 
-	def makeRtp(self, payload, frameNbr):
-		"""RTP-packetize the video data."""
-		version = 2
-		padding = 0
-		extension = 0
-		cc = 0
-		marker = 0
-		pt = 26 # MJPEG type
-		seqnum = frameNbr
-		ssrc = 0 
-		
-		rtpPacket = RtpPacket()
-		
-		rtpPacket.encode(version, padding, extension, cc, seqnum, marker, pt, ssrc, payload)
-		
-		return rtpPacket.getPacket()
 		
 	def replyRtsp(self, code, seq):
 		"""Send RTSP reply to the client."""
 		if code == self.OK_200:
-			#print("200 OK")
+
 			reply = 'RTSP/1.0 200 OK\nCSeq: ' + seq + '\nSession: ' + str(self.clientInfo['session'])
 			connSocket = self.clientInfo['rtspSocket'][0]
 			connSocket.send(reply.encode())
@@ -159,3 +124,62 @@ class ServerWorker:
 			print("404 NOT FOUND")
 		elif code == self.CON_ERR_500:
 			print("500 CONNECTION ERROR")
+
+	def sendRtp(self):
+			"""Send RTP packets over UDP."""
+			rtpSocket = self.clientInfo['rtpSocket']
+
+			address = self.clientInfo['rtspSocket'][1][0]
+			rtpPort = int(self.clientInfo['rtpPort'])
+			
+			while True:
+				self.clientInfo['event'].wait(0.05) 
+				
+				if self.clientInfo['event'].isSet(): 
+					break 
+				data = self.clientInfo['videoStream'].nextFrame()
+				if data: 
+					# FRAGMENTATION
+					frameNumber = self.clientInfo['videoStream'].frameNbr()
+					
+					# get timestamp
+					current_timestamp = int(time())
+					
+					payload = data
+					size = len(payload)
+					offset = 0
+					
+					# Cut frame
+					while offset < size:
+						chunk = payload[offset : offset + self.MAX_PAYLOAD_SIZE]
+						offset += len(chunk)
+						
+						if offset >= size:
+							marker = 1
+						else:
+							marker = 0
+
+						seqnum = self.clientInfo['rtpSeqNum']
+						self.clientInfo['rtpSeqNum'] += 1
+						
+						try:
+							# send packet
+							packet = self.makeRtp(chunk, seqnum, current_timestamp, marker)
+							rtpSocket.sendto(packet, (address, rtpPort))
+						except:
+							print("Connection Error")
+
+
+	def makeRtp(self, payload, seqnum, timestamp, marker):
+		"""RTP-packetize the video data."""
+		version = 2
+		padding = 0
+		extension = 0
+		cc = 0
+		pt = 26 
+		ssrc = 1111 
+		rtpPacket = RtpPacket()
+		# Encode the packet with the provided header fields and payload
+		rtpPacket.encode(version, padding, extension, cc, seqnum, marker, pt, ssrc, timestamp, payload)
+		# Return the packet as a byte stream to be sent over UDP
+		return rtpPacket.getPacket()
