@@ -4,14 +4,14 @@ import socket
 import threading
 import os
 from PIL import Image, ImageTk
-import socket, threading, sys, traceback, os
-from queue import Queue
-import time
+import sys, traceback, time
+from collections import deque
 
 from RtpPacket import RtpPacket
 
 CACHE_FILE_NAME = "cache-"
 CACHE_FILE_EXT = ".jpg"
+
 
 class Client:
     INIT = 0
@@ -24,7 +24,12 @@ class Client:
     PAUSE = 2
     TEARDOWN = 3
 
-    # Initiation..
+    # Buffer settings (tweak as needed)
+    FRAME_RATE = 20                   # expected fps (used for timing)
+    BUFFER_MAX_FRAMES = 400           # max frames to keep in memory (e.g. 20s if 20fps -> 20s)
+    PREFETCH_FRAMES = 40              # buffer fill threshold before starting playback (~2s)
+    SOCKET_TIMEOUT = 0.5              # UDP socket timeout
+
     def __init__(self, master, serveraddr, serverport, rtpport, filename):
         self.master = master
         self.master.protocol("WM_DELETE_WINDOW", self.handler)
@@ -33,238 +38,335 @@ class Client:
         self.serverPort = int(serverport)
         self.rtpPort = int(rtpport)
         self.fileName = filename
+
+        # RTSP control/state
         self.rtspSeq = 0
         self.sessionId = 0
         self.requestSent = -1
         self.teardownAcked = 0
+
+        # Buffer / playback
+        self.buffer = deque(maxlen=self.BUFFER_MAX_FRAMES)  # stores frames (bytes)
+        self.buffer_lock = threading.Lock()
+        self.buffer_start_frame_no = 0    # absolute frame number of buffer[0]
+        self.total_frames_received = 0    # absolute frame count received so far
+        self.play_index = 0               # absolute frame index we are currently showing
+        self.video_ready_event = threading.Event()  # set when buffer has PREFETCH_FRAMES
+        self.play_event = threading.Event()        # controls play/pause (set=playing)
+        self.stop_receive = threading.Event()      # signal to stop receiver thread
+
+        # Threads
+        self.rtp_thread = None
+        self.renderer_thread = threading.Thread(target=self.renderVideo, daemon=True)
+        self.renderer_thread.start()
+
+        # connect to server
         self.connectToServer()
-        self.frameNbr = 0
 
-        # --- Buffering configuration ---
-        self.frameBuffer = Queue(maxsize=50)  # max frames to cache
-        self.MIN_BUFFER = 20                  # start playback when buffer reaches this
-        # start renderer thread (daemon) so it runs in background
-        self.startBufferRenderer()
-
+    # ---------------- GUI ----------------
     def createWidgets(self):
-        """Build GUI."""
-        # Create Setup button
-        self.setup = Button(self.master, width=20, padx=3, pady=3)
-        self.setup["text"] = "Setup"
-        self.setup["command"] = self.setupMovie
+        self.setup = Button(self.master, width=20, text="Setup", command=self.setupMovie)
         self.setup.grid(row=1, column=0, padx=2, pady=2)
 
-        # Create Play button		
-        self.start = Button(self.master, width=20, padx=3, pady=3)
-        self.start["text"] = "Play"
-        self.start["command"] = self.playMovie
+        self.start = Button(self.master, width=20, text="Play", command=self.playMovie)
         self.start.grid(row=1, column=1, padx=2, pady=2)
 
-        # Create Pause button			
-        self.pause = Button(self.master, width=20, padx=3, pady=3)
-        self.pause["text"] = "Pause"
-        self.pause["command"] = self.pauseMovie
+        self.pause = Button(self.master, width=20, text="Pause", command=self.pauseMovie)
         self.pause.grid(row=1, column=2, padx=2, pady=2)
 
-        # Create Teardown button
-        self.teardown = Button(self.master, width=20, padx=3, pady=3)
-        self.teardown["text"] = "Teardown"
-        self.teardown["command"] =  self.exitClient
+        self.teardown = Button(self.master, width=20, text="Teardown", command=self.exitClient)
         self.teardown.grid(row=1, column=3, padx=2, pady=2)
 
-        # Create a label to display the movie
-        self.label = Label(self.master, height=19)
-        self.label.grid(row=0, column=0, columnspan=4, sticky=W+E+N+S, padx=5, pady=5) 
+        # SEEK BACK
+        self.backward = Button(self.master, width=20, text="<< Back", command=self.seekBackward)
+        self.backward.grid(row=2, column=0, padx=2, pady=2)
 
+        # SEEK FORWARD
+        self.forward = Button(self.master, width=20, text="Forward >>", command=self.seekForward)
+        self.forward.grid(row=2, column=1, padx=2, pady=2)
+
+        self.label = Label(self.master, height=19)
+        self.label.grid(row=0, column=0, columnspan=4, sticky=W+E+N+S, padx=5, pady=5)
+
+        # status label
+        self.status_var = StringVar(value="State: INIT")
+        self.status = Label(self.master, textvariable=self.status_var)
+        self.status.grid(row=3, column=0, columnspan=4, sticky=W+E, padx=5, pady=2)
+
+    # ---------------- RTSP button handlers ----------------
     def setupMovie(self):
-        """Setup button handler."""
         if self.state == self.INIT:
             self.sendRtspRequest(self.SETUP)
 
     def exitClient(self):
-        """Teardown button handler."""
-        self.sendRtspRequest(self.TEARDOWN)		
-        self.master.destroy() # Close the gui window
+        # send TEARDOWN and cleanup
+        if self.state != self.INIT:
+            self.sendRtspRequest(self.TEARDOWN)
+            # Wait briefly for teardown handshake
+            time.sleep(0.2)
 
-         # Delete the cache image from video
+        # set teardown flag and stop threads
+        self.stop_receive.set()
+        self.play_event.clear()
+        self.video_ready_event.clear()
+
+        # close sockets if open
         try:
-            os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT)
-        except OSError:
+            if hasattr(self, "rtpSocket"):
+                self.rtpSocket.close()
+        except:
+            pass
+        try:
+            if hasattr(self, "rtspSocket"):
+                self.rtspSocket.shutdown(socket.SHUT_RDWR)
+                self.rtspSocket.close()
+        except:
             pass
 
+        # clear buffer and delete cache file
+        with self.buffer_lock:
+            self.buffer.clear()
+
+        try:
+            os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT)
+        except:
+            pass
+
+        self.master.destroy()
+
     def pauseMovie(self):
-        """Pause button handler."""
         if self.state == self.PLAYING:
             self.sendRtspRequest(self.PAUSE)
+            # pause rendering
+            self.play_event.clear()
+            self.status_var.set("State: PAUSE")
 
     def playMovie(self):
-        """Play button handler."""
-        if self.state == self.READY:
-            # Create a new thread to listen for RTP packets
-            threading.Thread(target=self.listenRtp).start()
-            self.playEvent = threading.Event()
-            self.playEvent.clear()
+        # only allow play when READY or currently PAUSED
+        if self.state in (self.READY, self.PLAYING):
+            # if first play -> start RTP receiver
+            if not self.rtp_thread or not self.rtp_thread.is_alive():
+                self.stop_receive.clear()
+                self.rtp_thread = threading.Thread(target=self.listenRtp, daemon=True)
+                self.rtp_thread.start()
+
+            # if buffer hasn't reached prefetch threshold, wait (non-blocking)
+            if not self.video_ready_event.is_set():
+                self.status_var.set("Buffering...")
+            # set play event (renderer will only start when video_ready_event is set)
+            self.play_event.set()
             self.sendRtspRequest(self.PLAY)
+            self.status_var.set("State: PLAYING")
 
-    def listenRtp(self):        
-        """Listen for RTP packets."""
-        
-        # Buffer for reassembly of fragmented frames
+    # ---------------- SEEK ----------------
+    def seekForward(self, sec=2):
+        """seek forward by sec seconds (within buffer)."""
+        with self.buffer_lock:
+            jump = int(sec * self.FRAME_RATE)
+            target = self.play_index + jump
+            buffer_start = self.buffer_start_frame_no
+            buffer_end = buffer_start + len(self.buffer) - 1
+            if target > buffer_end:
+                # cannot seek past buffer end
+                self.play_index = buffer_end
+            else:
+                self.play_index = target
+        self.status_var.set(f"Seek -> frame {self.play_index}")
+
+    def seekBackward(self, sec=2):
+        """seek backward by sec seconds (within buffer)."""
+        with self.buffer_lock:
+            jump = int(sec * self.FRAME_RATE)
+            target = self.play_index - jump
+            if target < self.buffer_start_frame_no:
+                self.play_index = self.buffer_start_frame_no
+            else:
+                self.play_index = target
+        self.status_var.set(f"Seek -> frame {self.play_index}")
+
+    # ---------------- RTP listener (streaming, limited buffer) ----------------
+    def listenRtp(self):
+        """Receive RTP packets and maintain a limited in-memory buffer (deque)."""
         frameBuffer = b""
-        
-        while True:
-            try:
-                data = self.rtpSocket.recv(20480) # Receive packet
-                if data:
-                    rtpPacket = RtpPacket()
-                    rtpPacket.decode(data)
-                    
-                    payload = rtpPacket.getPayload()
-                    marker = rtpPacket.marker()
-                    
-                    # Reassemble fragments into a full frame
-                    frameBuffer += payload
-                    
-                    if marker == 1:
-                        # Full frame received in frameBuffer (bytes)
-                        # Instead of rendering immediately, push into frameBuffer queue
-                        try:
-                            if not self.frameBuffer.full():
-                                # put a copy of the bytes into the queue
-                                self.frameBuffer.put(frameBuffer)
-                            else:
-                                # If buffer full, drop oldest frame then put new one (to keep fresh)
-                                try:
-                                    self.frameBuffer.get_nowait()
-                                    self.frameBuffer.put(frameBuffer)
-                                except:
-                                    pass
-                        except:
-                            pass
+        expected_seq = None
 
-                        # update last received frame number (for bookkeeping)
-                        currFrameNbr = rtpPacket.seqNum()
-                        self.frameNbr = currFrameNbr
-
-                        # reset reassembly buffer
-                        frameBuffer = b""
-
-            except:
-                # Stop listening upon requesting PAUSE or TEARDOWN
-                if hasattr(self, 'playEvent') and self.playEvent.isSet(): 
-                    break
-                
-                if self.teardownAcked == 1:
-                    try:
-                        self.rtpSocket.shutdown(socket.SHUT_RDWR)
-                        self.rtpSocket.close()
-                    except:
-                        pass
-                    break
-
-    def writeFrame(self, data):
-        """Write the received frame to a temp image file. Return the image file."""
-        cachename = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
-        file = open(cachename, "wb")
-        file.write(data)
-        file.close()
-        
-        return cachename
-    
-    def updateMovie(self, imageFile):
-        """Update the image file as video frame in the GUI."""
+        # prepare UDP socket
+        self.rtpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.rtpSocket.settimeout(self.SOCKET_TIMEOUT)
         try:
+            self.rtpSocket.bind(('', self.rtpPort))
+        except Exception as e:
+            tkinter.messagebox.showwarning("Unable to Bind", f"Unable to bind PORT={self.rtpPort}: {e}")
+            return
+
+        while not self.stop_receive.is_set():
+            try:
+                data, _ = self.rtpSocket.recvfrom(65536)
+                if not data:
+                    continue
+
+                rtpPacket = RtpPacket()
+                try:
+                    rtpPacket.decode(data)
+                except Exception:
+                    # if RtpPacket can't decode, skip packet
+                    continue
+
+                payload = rtpPacket.getPayload()
+                marker = 0
+                try:
+                    marker = rtpPacket.marker()
+                except Exception:
+                    # if no marker method, try reading last byte heuristic (fallback)
+                    marker = 0
+
+                seq = None
+                # try to get seq number from packet if available
+                if hasattr(rtpPacket, "seqNum"):
+                    try:
+                        seq = rtpPacket.seqNum()
+                    except Exception:
+                        seq = None
+                else:
+                    # try attribute names used in some RtpPacket implementations
+                    seq = getattr(rtpPacket, "seq", None)
+
+                # Very simple sequence handling: if we detect a drop (non-consecutive seq),
+                # discard current frameBuffer to avoid heavy corruption.
+                if expected_seq is not None and seq is not None:
+                    if seq != expected_seq:
+                        # packet loss detected -> reset frameBuffer (drop partial)
+                        frameBuffer = b""
+                expected_seq = (seq + 1) if (seq is not None) else None
+
+                frameBuffer += payload
+
+                if marker == 1:
+                    # one complete frame available
+                    with self.buffer_lock:
+                        # append frame bytes; if deque full, leftmost frames get dropped automatically
+                        self.buffer.append(frameBuffer)
+                        self.total_frames_received += 1
+
+                        # if buffer was previously empty and this is the first frames we got,
+                        # set buffer_start_frame_no accordingly
+                        if len(self.buffer) == 1:
+                            self.buffer_start_frame_no = self.total_frames_received - 1
+
+                        # if play_index not initialized, set to earliest buffered frame
+                        if self.play_index < self.buffer_start_frame_no:
+                            self.play_index = self.buffer_start_frame_no
+
+                        # if we have prefetched enough frames -> set ready event
+                        if len(self.buffer) >= self.PREFETCH_FRAMES:
+                            self.video_ready_event.set()
+                    frameBuffer = b""
+
+            except socket.timeout:
+                # periodic wake: check teardown or continue
+                continue
+            except Exception:
+                # unexpected error -> break to avoid silent thread death
+                break
+
+        # cleanup
+        try:
+            self.rtpSocket.close()
+        except:
+            pass
+
+    # ---------------- disk write and GUI update ----------------
+    def writeFrame(self, data):
+        cachename = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
+        try:
+            with open(cachename, "wb") as f:
+                f.write(data)
+            return cachename
+        except Exception as e:
+            print("writeFrame error:", e)
+            return None
+
+    def updateMovie(self, imageFile):
+        if not imageFile:
+            return
+        try:
+            # defensive check
+            if not os.path.exists(imageFile):
+                return
             photo = ImageTk.PhotoImage(Image.open(imageFile))
-            self.label.configure(image = photo, height = 500) 
+            self.label.configure(image=photo, height=500)
             self.label.image = photo
         except Exception as e:
-            # If there's an error loading image, ignore to keep renderer running
             print("updateMovie error:", e)
 
+    # ---------------- RTSP connection and requests ----------------
     def connectToServer(self):
-        """Connect to the Server. Start a new RTSP/TCP session."""
         self.rtspSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             self.rtspSocket.connect((self.serverAddr, self.serverPort))
-        except:
-            tkinter.messagebox.showwarning('Connection Failed', 'Connection to \'%s\' failed.' %self.serverAddr)
+        except Exception:
+            tkinter.messagebox.showwarning('Connection Failed', f'Connection to "{self.serverAddr}" failed.')
 
     def sendRtspRequest(self, requestCode):
-        """Send RTSP request to the server."""	
-        #-------------
-        # TO COMPLETE
-        #-------------
-        
-        # Setup request
         if requestCode == self.SETUP and self.state == self.INIT:
-            threading.Thread(target=self.recvRtspReply).start()
-            # Update RTSP sequence number.
+            threading.Thread(target=self.recvRtspReply, daemon=True).start()
             self.rtspSeq += 1
-            
-            # Write the RTSP request to be sent.
-            request = f"SETUP {self.fileName} RTSP/1.0\nCSeq: {self.rtspSeq}\nTransport: RTP/UDP; client_port= {self.rtpPort}\n"
-            
-            # Keep track of the sent request.
+            request = (
+                f"SETUP {self.fileName} RTSP/1.0\n"
+                f"CSeq: {self.rtspSeq}\n"
+                f"Transport: RTP/UDP; client_port= {self.rtpPort}\n"
+            )
             self.requestSent = self.SETUP
-        
-        # Play request
-        elif requestCode == self.PLAY and self.state == self.READY:
-            # Update RTSP sequence number.
+
+        elif requestCode == self.PLAY and self.state in (self.READY, self.PLAYING):
             self.rtspSeq += 1
-            
-            # Write the RTSP request to be sent.
-            request = f"PLAY {self.fileName} RTSP/1.0\nCSeq: {self.rtspSeq}\nSession: {self.sessionId}\n"
-            
-            # Keep track of the sent request.
-            self.requestSent = self.PLAY 
-        
-        # Pause request
+            request = (
+                f"PLAY {self.fileName} RTSP/1.0\n"
+                f"CSeq: {self.rtspSeq}\n"
+                f"Session: {self.sessionId}\n"
+            )
+            self.requestSent = self.PLAY
+
         elif requestCode == self.PAUSE and self.state == self.PLAYING:
-            # Update RTSP sequence number.
             self.rtspSeq += 1
-            
-            # Write the RTSP request to be sent.
-            request = f"PAUSE {self.fileName} RTSP/1.0\nCSeq: {self.rtspSeq}\nSession: {self.sessionId}\n"
-            
-            # Keep track of the sent request.
+            request = (
+                f"PAUSE {self.fileName} RTSP/1.0\n"
+                f"CSeq: {self.rtspSeq}\n"
+                f"Session: {self.sessionId}\n"
+            )
             self.requestSent = self.PAUSE
-            
-        # Teardown request
-        elif requestCode == self.TEARDOWN and not self.state == self.INIT:
-            # Update RTSP sequence number.
+
+        elif requestCode == self.TEARDOWN and self.state != self.INIT:
             self.rtspSeq += 1
-            
-            # Write the RTSP request to be sent.
-            request = f"TEARDOWN {self.fileName} RTSP/1.0\nCSeq: {self.rtspSeq}\nSession: {self.sessionId}\n"
-            
-            # Keep track of the sent request.
+            request = (
+                f"TEARDOWN {self.fileName} RTSP/1.0\n"
+                f"CSeq: {self.rtspSeq}\n"
+                f"Session: {self.sessionId}\n"
+            )
             self.requestSent = self.TEARDOWN
         else:
             return
-        
-        # Send the RTSP request using rtspSocket.
+
         try:
             self.rtspSocket.send(request.encode())
-        except:
+        except Exception:
             print("Failed to send RTSP request.")
-        
-        print('\nData sent:\n' + request)
-    
+
+        print("\nData sent:\n" + request)
+
     def recvRtspReply(self):
-        """Receive RTSP reply from the server."""
         while True:
             try:
                 reply = self.rtspSocket.recv(1024)
             except:
                 reply = None
-            
-            if reply: 
+
+            if reply:
                 try:
-                    self.parseRtspReply(reply.decode("utf-8"))
+                    self.parseRtspReply(reply.decode())
                 except Exception as e:
                     print("parseRtspReply error:", e)
-            
-            # Close the RTSP socket upon requesting Teardown
+
             if self.requestSent == self.TEARDOWN:
                 try:
                     self.rtspSocket.shutdown(socket.SHUT_RDWR)
@@ -272,133 +374,118 @@ class Client:
                 except:
                     pass
                 break
-    
+
     def parseRtspReply(self, data):
-        """Parse the RTSP reply from the server."""
-        lines = data.split('\n')
-        # basic defensive parsing
+        lines = data.split("\n")
+
         try:
-            seqNum = int(lines[1].split(' ')[1])
+            seqNum = int(lines[1].split(" ")[1])
         except:
             return
-        
-        # Process only if the server reply's sequence number is the same as the request's
+
         if seqNum == self.rtspSeq:
             try:
-                session = int(lines[2].split(' ')[1])
+                session = int(lines[2].split(" ")[1])
             except:
                 session = 0
-            # New RTSP session ID
-            if self.sessionId == 0 and session != 0:
-                self.sessionId = session
-            
-            # Process only if the session ID is the same (or if not set)
-            if self.sessionId == session or self.sessionId == 0:
-                # success code 200
-                try:
-                    code = int(lines[0].split(' ')[1])
-                except:
-                    code = 0
-                if code == 200: 
-                    if self.requestSent == self.SETUP:
-                        # Update RTSP state.
-                        self.state = self.READY
-                        
-                        # Open RTP port.
-                        self.openRtpPort()
-                        # Ensure buffer empty at start
-                        self.clearBuffer()
-                        # Start buffering (renderer thread already started in __init__)
-                    elif self.requestSent == self.PLAY:
-                        self.state = self.PLAYING
-                    elif self.requestSent == self.PAUSE:
-                        self.state = self.READY
-                        
-                        # The play thread exits. A new thread is created on resume.
-                        if hasattr(self, 'playEvent'):
-                            self.playEvent.set()
-                        # On pause, clear buffer to avoid playing stale frames when resume
-                        self.clearBuffer()
-                    elif self.requestSent == self.TEARDOWN:
-                        self.state = self.INIT
-                        
-                        # Flag the teardownAcked to close the socket.
-                        self.teardownAcked = 1 
-                        # Clear buffer
-                        self.clearBuffer()
-    
-    def openRtpPort(self):
-        """Open RTP socket binded to a specified port."""
-        #-------------
-        # TO COMPLETE
-        #-------------
-        # Create a new datagram socket to receive RTP packets from the server
-        self.rtpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        
-        # Set the timeout value of the socket to 0.5sec
-        self.rtpSocket.settimeout(0.5)
-        
-        try:
-            # Bind the socket to the address using the RTP port given by the client user
-            self.rtpSocket.bind(('', self.rtpPort))
-        except:
-            tkinter.messagebox.showwarning('Unable to Bind', 'Unable to bind PORT=%d' %self.rtpPort)
 
+            if self.sessionId == 0:
+                self.sessionId = session
+
+            code = int(lines[0].split(" ")[1])
+
+            if code == 200:
+                if self.requestSent == self.SETUP:
+                    self.state = self.READY
+                    self.openRtpPort()
+                    self.status_var.set("State: READY")
+
+                elif self.requestSent == self.PLAY:
+                    self.state = self.PLAYING
+                    self.status_var.set("State: PLAYING")
+
+                elif self.requestSent == self.PAUSE:
+                    self.state = self.READY
+                    self.status_var.set("State: PAUSE")
+
+                elif self.requestSent == self.TEARDOWN:
+                    self.state = self.INIT
+                    self.teardownAcked = 1
+                    self.status_var.set("State: INIT")
+
+    def openRtpPort(self):
+        # socket created in listenRtp to avoid race on re-bind; this method left for compatibility
+        pass
+
+    # ---------------- handler for close ----------------
     def handler(self):
-        """Handler on explicitly closing the GUI window."""
         self.pauseMovie()
-        if tkinter.messagebox.askokcancel("Quit?", "Are you sure you want to quit?"):
+        if tkinter.messagebox.askokcancel("Quit?", "Are you sure?"):
             self.exitClient()
-        else: # When the user presses cancel, resume playing.
+        else:
             self.playMovie()
 
-    # ------------------ Buffer renderer methods ------------------
-    def startBufferRenderer(self):
-        """Start background thread that renders frames from buffer to GUI."""
-        t = threading.Thread(target=self.renderVideo, daemon=True)
-        t.start()
-
+    # ---------------- main renderer ----------------
     def renderVideo(self):
         """
-        Continuously check the frameBuffer and render frames when:
-        - client state is PLAYING
-        - buffer has at least MIN_BUFFER frames (prebuffering)
+        Renderer thread:
+        - Waits for video_ready_event (buffer prefetch) before showing frames.
+        - Uses play_event to pause/resume smoothly.
+        - Reads from buffer with lock and writes to cache file temporarily for ImageTk.
         """
-        # Sleep a bit initially to let setup happen
-        time.sleep(0.1)
+        frame_duration = 1.0 / max(1, self.FRAME_RATE)
         while True:
-            # If playing, only start rendering when buffer has enough frames
-            if self.state == self.PLAYING:
-                # Wait until minimum buffer is available
-                if self.frameBuffer.qsize() < self.MIN_BUFFER:
-                    # small sleep to avoid busy waiting
-                    time.sleep(0.01)
-                    continue
+            # exit condition: app closed
+            if self.stop_receive.is_set() and not self.play_event.is_set():
+                # ensure we close when teardown called
+                break
 
-                # Pop a frame and render it
-                try:
-                    frameBytes = self.frameBuffer.get(timeout=1.0)
-                    # write frame to cache file and update GUI
-                    imageFile = self.writeFrame(frameBytes)
-                    self.updateMovie(imageFile)
-                    # Sleep to match expected frame rate (server sends every 50ms)
-                    time.sleep(0.05)
-                except Exception as e:
-                    # If no frame available or error, wait a bit then continue
-                    # print("renderVideo exception:", e)
-                    time.sleep(0.01)
-                    continue
-            else:
-                # Not playing: sleep to reduce CPU usage
+            # Wait until user pressed play
+            if not self.play_event.wait(timeout=0.1):
+                continue
+
+            # Wait until buffer has enough prefetched frames
+            if not self.video_ready_event.wait(timeout=0.1):
+                # still buffering
+                self.status_var.set("Buffering...")
                 time.sleep(0.05)
+                continue
 
-    def clearBuffer(self):
-        """Empty the frame buffer queue."""
-        try:
-            while not self.frameBuffer.empty():
+            # compute local index inside buffer for current play_index
+            with self.buffer_lock:
+                buffer_start = self.buffer_start_frame_no
+                buffer_len = len(self.buffer)
+                buffer_end = buffer_start + buffer_len - 1
+
+                # if play_index is outside current buffer, clamp to available range
+                if self.play_index < buffer_start:
+                    self.play_index = buffer_start
+                if self.play_index > buffer_end:
+                    # not yet received frames to show; wait a bit
+                    self.video_ready_event.clear()  # request more buffering
+                    time.sleep(0.02)
+                    continue
+
+                local_idx = self.play_index - buffer_start
                 try:
-                    self.frameBuffer.get_nowait()
-                except:
-                    break
-        except:
-            pass
+                    frameBytes = self.buffer[local_idx]
+                except IndexError:
+                    # rare race -> skip iteration
+                    time.sleep(0.01)
+                    continue
+
+            # write to temp file and update GUI
+            imageFile = self.writeFrame(frameBytes)
+            if imageFile:
+                self.updateMovie(imageFile)
+
+            # advance play_index
+            with self.buffer_lock:
+                self.play_index += 1
+                # if we've consumed most of the buffer, clear video_ready_event so we wait for refill
+                if len(self.buffer) - (self.play_index - self.buffer_start_frame_no) < self.PREFETCH_FRAMES // 2:
+                    # buffer low
+                    self.video_ready_event.clear()
+
+            time.sleep(frame_duration)
+
