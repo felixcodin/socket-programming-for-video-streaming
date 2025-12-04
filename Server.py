@@ -24,11 +24,13 @@ class Server:
 			print(f"Port {SERVER_PORT} might be in use. Try lsof -ti :{SERVER_PORT} | xargs kill -9")
 			return
 		# Receive client info (address,port) through RTSP/TCP session
+		clients = []
 		try:
 			while True:
 				try:
 					clientInfo = {}
 					clientInfo['rtspSocket'] = rtspSocket.accept()
+					clients.append(clientInfo['rtspSocket'][0])
 					print(f"Client connected from {clientInfo['rtspSocket'][1]}")
 					ServerWorker(clientInfo).run()		
 				except socket.timeout:
@@ -39,6 +41,11 @@ class Server:
 		except KeyboardInterrupt:
 			print("\n\n Server shutting down...")
 		finally:
+			for client_socket in clients:
+				try:
+					client_socket.close()
+				except:
+					pass
 			rtspSocket.close()
 			print("Server stopped")
 		
