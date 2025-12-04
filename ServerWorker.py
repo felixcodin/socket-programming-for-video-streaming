@@ -32,12 +32,20 @@ class ServerWorker:
 	def recvRtspRequest(self):
 		"""Receive RTSP request from the client."""
 		connSocket = self.clientInfo['rtspSocket'][0]
-		while True:            
-			data = connSocket.recv(256)
-			if data:
-				print("Data received:\n" + data.decode("utf-8"))
-				self.processRtspRequest(data.decode("utf-8"))
-	
+		while True:     
+			try:       
+				data = connSocket.recv(256)
+				if data:
+					print("Data received:\n" + data.decode("utf-8"))
+					self.processRtspRequest(data.decode("utf-8"))
+				else:
+					break
+			except OSError:
+				break
+			except Exception as e:
+				print(f"Error receiving data: {e}")
+				break
+				
 	def processRtspRequest(self, data):
 		"""Process RTSP request sent from the client."""
 		# Get the request type
